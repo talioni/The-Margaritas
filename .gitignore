@@ -6,7 +6,9 @@ __pycache__/
 .DS_Store
 
 # Big datasets — regenerate with the download/build scripts
-datasets
+dataset/taco/
+dataset/raw_captures/
+dataset_cls/
 
 # Ultralytics auto-downloaded base model (not our work)
 yolov8n-cls.pt
