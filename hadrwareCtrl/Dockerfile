@@ -6,8 +6,8 @@ FROM python:3.11-slim
 # It binds against /usr/include/lgpio.h at build time.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        liblgpio-dev \
-        liblgpio1 \
+        gcc \
+        python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

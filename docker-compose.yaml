@@ -46,7 +46,7 @@ services:
     # If this fails, replace "gpio" with the host GID from
     #   getent group gpio
     group_add:
-      - "gpio"
+      - "986"
     environment:
       IMAGE_REC_URL: "http://trash-api:8000"
     networks:
