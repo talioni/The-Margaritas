@@ -1,0 +1,3 @@
+requests>=2.31
+gpiozero>=2.0
+lgpio>=0.2.2.0    # gpiozero backend that actually works on Raspberry Pi 5

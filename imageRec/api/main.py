@@ -6,9 +6,13 @@ on demand. The future main program calls these endpoints over the local Docker
 network and drives the hardware.
 
 Endpoints:
-    GET  /health        -> liveness + camera/model status
-    GET  /predict       -> grab a fresh frame from the webcam and classify it
-    POST /predict       -> classify an uploaded image (testing aid, no camera)
+    GET  /health             -> liveness + camera/model status
+    GET  /predict            -> grab a fresh frame from the webcam and classify it
+    POST /predict            -> classify an uploaded image (testing aid, no camera)
+    GET  /wait_and_predict   -> block until an item is placed on the tray and is
+                                still, then classify and return. Used by the
+                                hadrwareCtrl orchestrator so it only acts when
+                                trash has actually been deposited.
 
 Run (locally, outside Docker):
     uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -17,6 +21,7 @@ Run (locally, outside Docker):
 import io
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -37,11 +42,31 @@ MIN_CONF = 0.50           # below this the top prediction is flagged "unsure"
 WARMUP_FRAMES = 10        # let the webcam stabilise on open
 FLUSH_FRAMES = 4          # drop buffered frames before reading a current one
 
+# --- Motion-trigger tuning (used by /wait_and_predict) ---------------------
+# How many "changed" pixels (vs the learnt empty-tray background) count as
+# someone moving an item into frame. Tune for your camera resolution + lighting.
+MOTION_PIXELS_MIN = int(os.getenv("MOTION_PIXELS_MIN", "8000"))
+# Number of consecutive low-motion frames after motion before we call the
+# scene "stable" and classify. ~15 frames is about 1s of stillness.
+STABLE_FRAMES     = int(os.getenv("STABLE_FRAMES", "15"))
+# Hard timeout for /wait_and_predict so the orchestrator can recover if the
+# tray is empty all day.
+MAX_WAIT_SECONDS  = int(os.getenv("MAX_WAIT_SECONDS", "120"))
+# Pause between frame reads inside the wait loop (~20 fps). Keeps CPU low.
+FRAME_DELAY_S     = 0.05
+# How many frames we feed to the background subtractor on first call so it
+# has a sense of "empty tray" before we start looking for motion.
+BG_WARMUP_FRAMES  = 30
+
 # --- Shared state ----------------------------------------------------------
 
 model: YOLO | None = None
 camera: cv2.VideoCapture | None = None
 _camera_lock = threading.Lock()   # a single VideoCapture is not concurrency-safe
+
+# Lazily created on the first /wait_and_predict call so endpoints that don't
+# need it (/health, /predict, POST /predict) don't pay the cost.
+motion_subtractor: "cv2.BackgroundSubtractor | None" = None
 
 
 def _open_camera() -> "cv2.VideoCapture | None":
@@ -134,3 +159,82 @@ async def predict_from_upload(file: UploadFile = File(...)):
     except (UnidentifiedImageError, OSError):
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
     return _classify(image)
+
+
+@app.get("/wait_and_predict")
+def wait_and_predict():
+    """
+    Block until an item appears on the tray and has been still for a moment,
+    then classify and return. Used by the hadrwareCtrl orchestrator to drive
+    the servo only when trash has actually been deposited.
+
+    State machine:
+        IDLE   -> waits for motion (pixels changed > MOTION_PIXELS_MIN)
+        MOTION -> waits for STABLE_FRAMES consecutive low-motion frames
+        STABLE -> classify the current frame and return
+
+    Returns the same shape as /predict, with an extra "waited_seconds" field.
+    Returns HTTP 408 if MAX_WAIT_SECONDS elapses with no stable item.
+    """
+    if camera is None or not camera.isOpened():
+        raise HTTPException(status_code=503, detail="Camera not available")
+
+    global motion_subtractor
+
+    captured_frame = None
+    start = time.time()
+
+    with _camera_lock:
+        # Lazy-init the background subtractor on first call and seed it on the
+        # current scene (which should be an empty tray when the orchestrator
+        # boots).
+        if motion_subtractor is None:
+            motion_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=50, varThreshold=40, detectShadows=False,
+            )
+            for _ in range(BG_WARMUP_FRAMES):
+                ok, f = camera.read()
+                if ok and f is not None:
+                    motion_subtractor.apply(f, learningRate=0.3)
+
+        state = "IDLE"
+        stable_count = 0
+
+        while time.time() - start < MAX_WAIT_SECONDS:
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                time.sleep(0.02)
+                continue
+
+            # Background subtraction -> binary mask of what's changed.
+            # Pass a small learning rate so it slowly forgets transient noise
+            # without "eating" a stationary item.
+            fg = motion_subtractor.apply(frame, learningRate=0.001)
+            fg = cv2.medianBlur(fg, 5)
+            motion_pixels = int((fg > 200).sum())
+            in_motion = motion_pixels > MOTION_PIXELS_MIN
+
+            if state == "IDLE":
+                if in_motion:
+                    state = "MOTION"
+                    stable_count = 0
+            elif state == "MOTION":
+                if in_motion:
+                    stable_count = 0
+                else:
+                    stable_count += 1
+                    if stable_count >= STABLE_FRAMES:
+                        captured_frame = frame.copy()
+                        break  # item placed and still — classify outside the lock
+
+            time.sleep(FRAME_DELAY_S)
+
+    if captured_frame is None:
+        raise HTTPException(
+            status_code=408,
+            detail=f"No stable item within {MAX_WAIT_SECONDS}s",
+        )
+
+    result = _classify(captured_frame)
+    result["waited_seconds"] = round(time.time() - start, 2)
+    return result
