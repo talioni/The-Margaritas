@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9         # required by FastAPI for the POST /predict upload endpoint
+ultralytics>=8.4.0
+pi-heif>=0.18.0                  # ultralytics auto-installs this at runtime otherwise; bake it in for offline Pi
+opencv-python-headless>=4.8.0   # headless: V4L2 webcam capture works, no GUI/X11 libs in container
+pillow>=10.0.0
