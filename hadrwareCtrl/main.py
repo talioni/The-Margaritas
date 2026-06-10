@@ -4,16 +4,19 @@ Hardware-control orchestrator for the trash sorter.
 This service is the brain of the appliance:
     1. Calls the imageRec API (trash-api:8000) /wait_and_predict, which
        blocks until trash has been placed on the tray.
-    2. Looks up the bin angle for the predicted class.
-    3. Drives the servo to that angle, holds while the item drops, then
-       returns to neutral.
+    2. Looks up the bin position for the predicted class.
+    3. Drives the stepper to rotate the bin to that position, then opens
+       the lid servo, holds while the item drops, closes the lid and
+       returns the bin to home.
     4. Loops forever.
 
 The imageRec service does the camera reading and ML inference; we just
 poll it. That's why this container does NOT expose an HTTP API of its own.
 
 GPIO pin numbers are intentionally left as None — fill them in once the
-wiring is finalised. See PIN_LAYOUT below.
+wiring is finalised. With pins unset, both the stepper and the lid servo
+run in "dry-run" mode (logs only, no GPIO) so the logic can be tested
+without the real hardware.
 
 Run (inside the container):
     python main.py
@@ -30,28 +33,45 @@ import requests
 # PIN LAYOUT — fill in once the wiring is finalised.
 # ---------------------------------------------------------------------------
 # All pin numbers are BCM (the gpiozero default).
-# Leave as None to keep the servo in "dry-run" mode (logs only, no GPIO).
-SERVO_PIN: int | None = None
+# Leave the stepper pins as None to keep the stepper in dry-run mode, and the
+# servo pin as None to keep the lid servo in dry-run mode.
+STEP_PIN: int | None = None   # STEP input of the stepper driver (A4988/DRV8825-style)
+DIR_PIN: int | None = None    # DIR input of the stepper driver
+LID_SERVO_PIN: int | None = None
+
+# Master switch (set by docker-compose / .env). When false, everything stays in
+# dry-run mode no matter what the pins above are set to.
+GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
-# Servo + sort behaviour
+# Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-SERVO_MIN_ANGLE      = -90
-SERVO_MAX_ANGLE      =  90
-SERVO_MIN_PULSE_S    = 0.0005   # tune for the specific servo if it jitters
-SERVO_MAX_PULSE_S    = 0.0025
-SERVO_SETTLE_S       = 0.4      # wait after each move before considering it done
+STEPS_PER_REV   = 200       # full steps per revolution (1.8°/step). Multiply by
+                            # the driver's microstepping if you enable it.
+STEP_PULSE_S    = 0.001     # high/low time of each STEP pulse; raise if it stalls
+HOME_ANGLE      = 0
 
-NEUTRAL_ANGLE        = 0
-HOLD_AFTER_SORT_S    = 3.0      # how long the flap stays tilted to let the item drop
-COOLDOWN_AFTER_SORT_S = 1.5     # short pause before asking imageRec for the next item
-
-# Predicted-class -> servo angle. Symmetric 60° spacing as specified.
+# Predicted-class -> bin angle the stepper rotates to. Symmetric 60° spacing.
 CLASS_TO_ANGLE: dict[str, int] = {
     "organic":    -60,
     "pmd":          0,
     "restafval":   60,
 }
+
+# ---------------------------------------------------------------------------
+# Lid servo behaviour
+# ---------------------------------------------------------------------------
+SERVO_MIN_ANGLE   = -90
+SERVO_MAX_ANGLE   =  90
+SERVO_MIN_PULSE_S = 0.0005  # tune for the specific servo if it jitters
+SERVO_MAX_PULSE_S = 0.0025
+SERVO_SETTLE_S    = 0.4     # wait after each move before considering it done
+
+LID_OPEN_ANGLE    = 90
+LID_CLOSED_ANGLE  = 0
+
+HOLD_LID_OPEN_S      = 3.0  # how long the lid stays open to let the item drop
+COOLDOWN_AFTER_SORT_S = 1.5 # short pause before asking imageRec for the next item
 
 # ---------------------------------------------------------------------------
 # imageRec endpoint
@@ -65,33 +85,75 @@ WAIT_PREDICT_TIMEOUT_S = float(os.getenv("WAIT_PREDICT_TIMEOUT_S", "180"))
 # If imageRec is still booting / temporarily down, back off and retry.
 API_RETRY_BACKOFF_S = 3.0
 
-# Below this confidence the orchestrator refuses to act (keeps servo at neutral
+# Below this confidence the orchestrator refuses to act (keeps the bin at home
 # so a wrong guess can't dump trash in the wrong bin).
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.55"))
 
+
 # ---------------------------------------------------------------------------
-# Servo abstraction — real on the Pi, dry-run elsewhere or when SERVO_PIN
-# hasn't been set yet.
+# Stepper abstraction — real on the Pi, dry-run when the pins aren't set.
 # ---------------------------------------------------------------------------
-class _DryRunServo:
-    """Stand-in used when SERVO_PIN is None — logs moves without touching GPIO."""
+class _DryRunStepper:
+    """Stand-in used when the stepper pins are None — logs moves, no GPIO."""
 
     def __init__(self) -> None:
-        self.angle = NEUTRAL_ANGLE
+        self.angle = HOME_ANGLE
 
     def move_to(self, angle: int) -> None:
-        logging.info("[dry-run servo] moving to %d°", angle)
+        logging.info("[dry-run stepper] rotating to %d°", angle)
         self.angle = angle
 
     def close(self) -> None:
-        logging.info("[dry-run servo] closed")
+        logging.info("[dry-run stepper] closed")
+
+
+class _RealStepper:
+    """Step/direction stepper driver (A4988/DRV8825-style) via gpiozero."""
+
+    def __init__(self, step_pin: int, dir_pin: int) -> None:
+        from gpiozero import Device, OutputDevice
+        from gpiozero.pins.lgpio import LGPIOFactory
+
+        Device.pin_factory = LGPIOFactory()
+        self._step = OutputDevice(step_pin)
+        self._dir = OutputDevice(dir_pin)
+        self._position_steps = 0  # current position in steps, 0 == HOME_ANGLE
+
+    def move_to(self, angle: int) -> None:
+        logging.info("stepper -> %d°", angle)
+        target_steps = round(angle / 360 * STEPS_PER_REV)
+        delta = target_steps - self._position_steps
+        self._dir.value = 1 if delta > 0 else 0
+        for _ in range(abs(delta)):
+            self._step.on()
+            time.sleep(STEP_PULSE_S)
+            self._step.off()
+            time.sleep(STEP_PULSE_S)
+        self._position_steps = target_steps
+
+    def close(self) -> None:
+        self.move_to(HOME_ANGLE)
+        self._step.close()
+        self._dir.close()
+
+
+# ---------------------------------------------------------------------------
+# Lid servo abstraction — real on the Pi, dry-run when the pin isn't set.
+# ---------------------------------------------------------------------------
+class _DryRunServo:
+    """Stand-in used when LID_SERVO_PIN is None — logs moves, no GPIO."""
+
+    def open(self) -> None:
+        logging.info("[dry-run servo] lid open")
+
+    def close(self) -> None:
+        logging.info("[dry-run servo] lid closed")
 
 
 class _RealServo:
-    """Real servo driven by gpiozero. Only imported if SERVO_PIN is set."""
+    """Lid servo driven by gpiozero. Only imported if LID_SERVO_PIN is set."""
 
     def __init__(self, pin: int) -> None:
-        # Imported here so the dry-run path doesn't need gpiozero installed.
         from gpiozero import AngularServo, Device
         from gpiozero.pins.lgpio import LGPIOFactory
 
@@ -103,27 +165,42 @@ class _RealServo:
             min_pulse_width=SERVO_MIN_PULSE_S,
             max_pulse_width=SERVO_MAX_PULSE_S,
         )
+        self._move(LID_CLOSED_ANGLE)
 
-    def move_to(self, angle: int) -> None:
-        angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, angle))
-        logging.info("servo -> %d°", angle)
+    def _move(self, angle: int) -> None:
         self._servo.angle = angle
         time.sleep(SERVO_SETTLE_S)
 
+    def open(self) -> None:
+        logging.info("servo -> lid open (%d°)", LID_OPEN_ANGLE)
+        self._move(LID_OPEN_ANGLE)
+
     def close(self) -> None:
-        self._servo.angle = NEUTRAL_ANGLE
-        time.sleep(SERVO_SETTLE_S)
+        logging.info("servo -> lid closed (%d°)", LID_CLOSED_ANGLE)
+        self._move(LID_CLOSED_ANGLE)
         self._servo.close()
 
 
-def _make_servo():
-    if SERVO_PIN is None:
+def _make_stepper():
+    if not GPIO_ENABLED or STEP_PIN is None or DIR_PIN is None:
         logging.warning(
-            "SERVO_PIN is None — running in dry-run mode (no GPIO output). "
-            "Fill it in in hadrwareCtrl/main.py once wiring is finalised."
+            "GPIO disabled or STEP_PIN/DIR_PIN not set — stepper in dry-run mode "
+            "(no GPIO). Set GPIO_ENABLED=true and fill the pins in "
+            "hadrwareCtrl/main.py once wiring is finalised."
+        )
+        return _DryRunStepper()
+    return _RealStepper(STEP_PIN, DIR_PIN)
+
+
+def _make_servo():
+    if not GPIO_ENABLED or LID_SERVO_PIN is None:
+        logging.warning(
+            "GPIO disabled or LID_SERVO_PIN not set — lid servo in dry-run mode "
+            "(no GPIO). Set GPIO_ENABLED=true and fill the pin in "
+            "hadrwareCtrl/main.py once wiring is finalised."
         )
         return _DryRunServo()
-    return _RealServo(SERVO_PIN)
+    return _RealServo(LID_SERVO_PIN)
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +264,9 @@ def main() -> int:
     logging.info("class -> angle map: %s", CLASS_TO_ANGLE)
 
     _wait_for_health()
+    stepper = _make_stepper()
     servo = _make_servo()
-    servo.move_to(NEUTRAL_ANGLE)
+    stepper.move_to(HOME_ANGLE)
 
     try:
         while True:
@@ -207,16 +285,18 @@ def main() -> int:
             elif cls not in CLASS_TO_ANGLE:
                 logging.warning("unknown class %r — not sorting.", cls)
             else:
-                target = CLASS_TO_ANGLE[cls]
-                servo.move_to(target)
-                time.sleep(HOLD_AFTER_SORT_S)
-                servo.move_to(NEUTRAL_ANGLE)
+                stepper.move_to(CLASS_TO_ANGLE[cls])
+                servo.open()
+                time.sleep(HOLD_LID_OPEN_S)
+                servo.close()
+                stepper.move_to(HOME_ANGLE)
 
             time.sleep(COOLDOWN_AFTER_SORT_S)
     except KeyboardInterrupt:
         logging.info("interrupted by user")
     finally:
         servo.close()
+        stepper.close()
     return 0
 
 

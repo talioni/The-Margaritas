@@ -9,10 +9,10 @@ Endpoints:
     GET  /health             -> liveness + camera/model status
     GET  /predict            -> grab a fresh frame from the webcam and classify it
     POST /predict            -> classify an uploaded image (testing aid, no camera)
-    GET  /wait_and_predict   -> block until an item is placed on the tray and is
-                                still, then classify and return. Used by the
-                                hadrwareCtrl orchestrator so it only acts when
-                                trash has actually been deposited.
+    GET  /wait_and_predict   -> classify frames until one class stays above the
+                                confidence trigger for a second, then return it
+                                (else "unsure"). Used by the hadrwareCtrl
+                                orchestrator to drive the bin only when sure.
 
 Run (locally, outside Docker):
     uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -34,39 +34,48 @@ from ultralytics import YOLO
 
 # Default points at where the Dockerfile bakes the weights; overridable for
 # running outside the container (e.g. the dev box).
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "classify" / "train_v2-6" / "weights" / "best.pt"
+DEFAULT_MODEL_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "runs"
+    / "classify"
+    / "train_v2-6"
+    / "weights"
+    / "best.pt"
+)
 MODEL_PATH = os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 IMG_SIZE = 224
-MIN_CONF = 0.50           # below this the top prediction is flagged "unsure"
-WARMUP_FRAMES = 10        # let the webcam stabilise on open
-FLUSH_FRAMES = 4          # drop buffered frames before reading a current one
+MIN_CONF = 0.50  # below this the top prediction is flagged "unsure"
+WARMUP_FRAMES = 10  # let the webcam stabilise on open
+FLUSH_FRAMES = 4  # drop buffered frames before reading a current one
 
-# --- Motion-trigger tuning (used by /wait_and_predict) ---------------------
-# How many "changed" pixels (vs the learnt empty-tray background) count as
-# someone moving an item into frame. Tune for your camera resolution + lighting.
-MOTION_PIXELS_MIN = int(os.getenv("MOTION_PIXELS_MIN", "8000"))
-# Number of consecutive low-motion frames after motion before we call the
-# scene "stable" and classify. ~15 frames is about 1s of stillness.
-STABLE_FRAMES     = int(os.getenv("STABLE_FRAMES", "15"))
-# Hard timeout for /wait_and_predict so the orchestrator can recover if the
-# tray is empty all day.
-MAX_WAIT_SECONDS  = int(os.getenv("MAX_WAIT_SECONDS", "120"))
+# --- Confidence-trigger tuning (used by /wait_and_predict) -----------------
+# We classify frames continuously and return once one class stays on top with
+# confidence above CONF_TRIGGER for HOLD_SECONDS.
+#
+# Top-1 confidence (0-1) a class must clear to START a streak. "above 80".
+CONF_TRIGGER = float(os.getenv("CONF_TRIGGER", "0.80"))
+# Hysteresis: once a streak is running, only reset it if confidence drops below
+# this (or the top class changes). A live stream flickers 78%<->86% frame to
+# frame; without this gap a single dip would wipe the timer and we'd never reach
+# a full second. Keep it a bit below CONF_TRIGGER.
+CONF_RELEASE = float(os.getenv("CONF_RELEASE", "0.70"))
+# How long that confident streak must hold before we return and rotate the bin.
+HOLD_SECONDS = float(os.getenv("HOLD_SECONDS", "1.0"))
+# Hard timeout for /wait_and_predict so the orchestrator can recover if nothing
+# confident ever shows up. We return an "unsure" result instead of hanging.
+MAX_WAIT_SECONDS = int(os.getenv("MAX_WAIT_SECONDS", "120"))
 # Pause between frame reads inside the wait loop (~20 fps). Keeps CPU low.
-FRAME_DELAY_S     = 0.05
-# How many frames we feed to the background subtractor on first call so it
-# has a sense of "empty tray" before we start looking for motion.
-BG_WARMUP_FRAMES  = 30
+FRAME_DELAY_S = 0.05
+# Throttle for the live per-frame log so docker logs show what the demo shows
+# on screen, without spamming a line every frame.
+LOG_EVERY_S = float(os.getenv("LOG_EVERY_S", "0.5"))
 
 # --- Shared state ----------------------------------------------------------
 
 model: YOLO | None = None
 camera: cv2.VideoCapture | None = None
-_camera_lock = threading.Lock()   # a single VideoCapture is not concurrency-safe
-
-# Lazily created on the first /wait_and_predict call so endpoints that don't
-# need it (/health, /predict, POST /predict) don't pay the cost.
-motion_subtractor: "cv2.BackgroundSubtractor | None" = None
+_camera_lock = threading.Lock()  # a single VideoCapture is not concurrency-safe
 
 
 def _open_camera() -> "cv2.VideoCapture | None":
@@ -89,8 +98,10 @@ async def lifespan(app: FastAPI):
 
     camera = _open_camera()
     if camera is None:
-        print(f"WARNING: webcam (index {CAMERA_INDEX}) not available; "
-              f"GET /predict will return 503. POST /predict still works.")
+        print(
+            f"WARNING: webcam (index {CAMERA_INDEX}) not available; "
+            f"GET /predict will return 503. POST /predict still works."
+        )
     else:
         print("Camera ready.")
 
@@ -104,6 +115,7 @@ app = FastAPI(title="Trash Sorter API", version="1.0", lifespan=lifespan)
 
 
 # --- Inference core (reused from scripts/live_predict_v2.py) ----------------
+
 
 def _classify(frame) -> dict:
     """Run the model on a frame (cv2 BGR ndarray or PIL RGB image) -> result dict."""
@@ -126,6 +138,7 @@ def _classify(frame) -> dict:
 
 # --- Endpoints -------------------------------------------------------------
 
+
 @app.get("/health")
 def health():
     return {
@@ -146,7 +159,9 @@ def predict_from_camera():
         for _ in range(FLUSH_FRAMES + 1):
             ok, frame = camera.read()
         if not ok or frame is None:
-            raise HTTPException(status_code=503, detail="Failed to read frame from camera")
+            raise HTTPException(
+                status_code=503, detail="Failed to read frame from camera"
+            )
         return _classify(frame)
 
 
@@ -157,48 +172,38 @@ async def predict_from_upload(file: UploadFile = File(...)):
     try:
         image = Image.open(io.BytesIO(raw)).convert("RGB")
     except (UnidentifiedImageError, OSError):
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
+        raise HTTPException(
+            status_code=400, detail="Uploaded file is not a valid image"
+        )
     return _classify(image)
 
 
 @app.get("/wait_and_predict")
 def wait_and_predict():
     """
-    Block until an item appears on the tray and has been still for a moment,
-    then classify and return. Used by the hadrwareCtrl orchestrator to drive
-    the servo only when trash has actually been deposited.
+    Watch the tray and classify frames until one class stays confidently on top
+    for a moment, then return it. Used by the hadrwareCtrl orchestrator to drive
+    the servo only once we're sure what was deposited.
 
-    State machine:
-        IDLE   -> waits for motion (pixels changed > MOTION_PIXELS_MIN)
-        MOTION -> waits for STABLE_FRAMES consecutive low-motion frames
-        STABLE -> classify the current frame and return
+    Logic is deliberately simple: classify each frame; when a class first clears
+    CONF_TRIGGER it starts a streak, and we return once that streak holds for
+    HOLD_SECONDS. To survive the normal frame-to-frame flicker of a live stream,
+    the streak only resets when the top class changes or confidence falls below
+    CONF_RELEASE (hysteresis) — a single dip from 84%% to 78%% does NOT reset it.
+    If nothing holds within MAX_WAIT_SECONDS we return an "unsure" result.
 
     Returns the same shape as /predict, with an extra "waited_seconds" field.
-    Returns HTTP 408 if MAX_WAIT_SECONDS elapses with no stable item.
     """
     if camera is None or not camera.isOpened():
         raise HTTPException(status_code=503, detail="Camera not available")
 
-    global motion_subtractor
-
-    captured_frame = None
     start = time.time()
 
     with _camera_lock:
-        # Lazy-init the background subtractor on first call and seed it on the
-        # current scene (which should be an empty tray when the orchestrator
-        # boots).
-        if motion_subtractor is None:
-            motion_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=50, varThreshold=40, detectShadows=False,
-            )
-            for _ in range(BG_WARMUP_FRAMES):
-                ok, f = camera.read()
-                if ok and f is not None:
-                    motion_subtractor.apply(f, learningRate=0.3)
-
-        state = "IDLE"
-        stable_count = 0
+        streak_class = None
+        streak_start = None
+        last_result = None
+        last_log = 0.0
 
         while time.time() - start < MAX_WAIT_SECONDS:
             ok, frame = camera.read()
@@ -206,35 +211,49 @@ def wait_and_predict():
                 time.sleep(0.02)
                 continue
 
-            # Background subtraction -> binary mask of what's changed.
-            # Pass a small learning rate so it slowly forgets transient noise
-            # without "eating" a stationary item.
-            fg = motion_subtractor.apply(frame, learningRate=0.001)
-            fg = cv2.medianBlur(fg, 5)
-            motion_pixels = int((fg > 200).sum())
-            in_motion = motion_pixels > MOTION_PIXELS_MIN
+            result = _classify(frame)
+            last_result = result
+            top = result["top"]
+            conf = result["confidence"]
+            now = time.time()
 
-            if state == "IDLE":
-                if in_motion:
-                    state = "MOTION"
-                    stable_count = 0
-            elif state == "MOTION":
-                if in_motion:
-                    stable_count = 0
-                else:
-                    stable_count += 1
-                    if stable_count >= STABLE_FRAMES:
-                        captured_frame = frame.copy()
-                        break  # item placed and still — classify outside the lock
+            if (
+                streak_class is not None
+                and top == streak_class
+                and conf >= CONF_RELEASE
+            ):
+                # Streak continues (tolerating dips down to CONF_RELEASE).
+                if now - streak_start >= HOLD_SECONDS:
+                    result["waited_seconds"] = round(now - start, 2)
+                    print(
+                        f"[wait] LOCKED {top} {conf*100:.1f}% "
+                        f"(held {now - streak_start:.1f}s) -> rotating bin",
+                        flush=True,
+                    )
+                    return result
+            elif conf >= CONF_TRIGGER:
+                # New (or first) confident class — (re)start the streak timer.
+                streak_class = top
+                streak_start = now
+            else:
+                # Not confident enough to hold anything.
+                streak_class = None
+                streak_start = None
+
+            # Throttled live log so docker logs mirror the demo's on-screen read.
+            if now - last_log >= LOG_EVERY_S:
+                held = (now - streak_start) if streak_start is not None else 0.0
+                print(f"[wait] {top} {conf*100:.1f}%  streak={held:.1f}s", flush=True)
+                last_log = now
 
             time.sleep(FRAME_DELAY_S)
 
-    if captured_frame is None:
-        raise HTTPException(
-            status_code=408,
-            detail=f"No stable item within {MAX_WAIT_SECONDS}s",
-        )
-
-    result = _classify(captured_frame)
+    # Nothing held above the trigger long enough — tell the caller we're unsure.
+    result = last_result or {
+        "top": None,
+        "confidence": 0.0,
+        "probabilities": {},
+    }
+    result["unsure"] = True
     result["waited_seconds"] = round(time.time() - start, 2)
     return result
