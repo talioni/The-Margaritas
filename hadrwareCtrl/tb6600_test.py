@@ -30,7 +30,7 @@ import time
 STEP_PIN = 20            # BCM. TB6600 PUL- (active-low, common-anode)
 DIR_PIN = 21             # BCM. TB6600 DIR-
 
-STEPS_PER_REV = 1600     # 200 full steps × 8 (TB6600 DIP set to 1/8 microstep)
+STEPS_PER_REV = 200     # 200 full steps × 8 (TB6600 DIP set to 1/8 microstep)
 STEP_PULSE_S = 0.001     # high/low time per STEP pulse; raise if it stalls
 PAUSE_BETWEEN_S = 1.0    # pause between direction changes
 CYCLES = 4               # how many forward+back cycles to run

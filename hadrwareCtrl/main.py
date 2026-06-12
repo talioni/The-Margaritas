@@ -46,7 +46,7 @@ GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in ("1", "true
 # ---------------------------------------------------------------------------
 # Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-STEPS_PER_REV   = 1600      # 200 full steps/rev × 8 (TB6600 DIP set to 1/8
+STEPS_PER_REV   = 200      # 200 full steps/rev × 8 (TB6600 DIP set to 1/8
                             # microstepping). Update if you change the DIPs.
 STEP_PULSE_S    = 0.001     # high/low time of each STEP pulse; raise if it stalls
 HOME_ANGLE      = 0
