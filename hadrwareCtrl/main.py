@@ -211,10 +211,6 @@ def _wait_for_prediction() -> dict | None:
             time.sleep(API_RETRY_BACKOFF_S)
             continue
 
-        # 408 = imageRec timed out waiting for an item. Loop back immediately.
-        if resp.status_code == 408:
-            logging.info("imageRec saw no item — looping.")
-            continue
         # 503 = camera not available / not initialised yet
         if resp.status_code == 503:
             logging.warning("imageRec reports camera unavailable — retrying in %.1fs",
@@ -237,7 +233,13 @@ def _wait_for_health() -> None:
         try:
             r = requests.get(url, timeout=5)
             if r.status_code == 200 and r.json().get("status") == "ok":
-                logging.info("imageRec is up. classes=%s", r.json().get("classes"))
+                body = r.json()
+                logging.info("imageRec is up. classes=%s", body.get("classes"))
+                if not body.get("camera"):
+                    logging.warning(
+                        "imageRec reports NO camera — /wait_and_predict will "
+                        "return 503 until the webcam is attached."
+                    )
                 return
         except requests.exceptions.RequestException:
             pass
@@ -267,13 +269,19 @@ def main() -> int:
             if result is None:
                 continue
 
-            cls   = result.get("top")
-            conf  = float(result.get("confidence", 0.0))
+            cls    = result.get("top")
+            conf   = float(result.get("confidence", 0.0))
+            unsure = bool(result.get("unsure", False))
             waited = result.get("waited_seconds", "?")
-            logging.info("prediction: %s (%.1f%%) after %ss",
-                         cls, conf * 100, waited)
+            logging.info("prediction: %s (%.1f%%) unsure=%s after %ss",
+                         cls, conf * 100, unsure, waited)
 
-            if conf < MIN_CONFIDENCE:
+            # "unsure" covers /wait_and_predict timing out: the API then returns
+            # its LAST frame's result, whose confidence can still read high even
+            # though nothing held the trigger — never sort on it.
+            if unsure or cls is None:
+                logging.info("imageRec is unsure — not sorting.")
+            elif conf < MIN_CONFIDENCE:
                 logging.info("confidence below %.2f — not sorting.", MIN_CONFIDENCE)
             elif cls not in CLASS_TO_ANGLE:
                 logging.warning("unknown class %r — not sorting.", cls)
