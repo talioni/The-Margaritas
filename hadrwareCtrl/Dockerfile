@@ -16,8 +16,9 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Application code (small — just main.py for now).
+# Application code.
 COPY main.py /app/main.py
+COPY tb6600.py /app/tb6600.py
 
 # Where to find the imageRec API on the docker-compose network. Override at
 # `docker compose up` time if you rename the service.

@@ -10,13 +10,13 @@ This service is the brain of the appliance:
        returns the bin to home.
     4. Loops forever.
 
-The imageRec service does the camera reading and ML inference; we just
-poll it. That's why this container does NOT expose an HTTP API of its own.
+The stepper itself lives in tb6600.py (raw lgpio, no gpiozero). Debug the
+motor with tb6600_test.py BEFORE running this — it has a staged diagnostic
+and a wiring/symptom guide in its docstring.
 
-GPIO pin numbers are intentionally left as None — fill them in once the
-wiring is finalised. With pins unset, both the stepper and the lid servo
-run in "dry-run" mode (logs only, no GPIO) so the logic can be tested
-without the real hardware.
+With GPIO_ENABLED unset/false, both the stepper and the lid servo run in
+"dry-run" mode (logs only, no GPIO) so the logic can be tested without the
+real hardware.
 
 Run (inside the container):
     python main.py
@@ -30,13 +30,10 @@ import time
 import requests
 
 # ---------------------------------------------------------------------------
-# PIN LAYOUT — fill in once the wiring is finalised.
+# PIN LAYOUT (BCM numbering)
 # ---------------------------------------------------------------------------
-# All pin numbers are BCM (the gpiozero default).
-# Leave the stepper pins as None to keep the stepper in dry-run mode, and the
-# servo pin as None to keep the lid servo in dry-run mode.
-STEP_PIN: int | None = 20   # PUL- of the TB6600 (active-low, common-anode wiring)
-DIR_PIN: int | None = 21    # DIR- of the TB6600
+STEP_PIN: int | None = 20   # TB6600 PUL-  (PUL+ -> 3.3 V, physical pin 1)
+DIR_PIN: int | None = 21    # TB6600 DIR-  (DIR+ -> 3.3 V)
 LID_SERVO_PIN: int | None = 25
 
 # Master switch (set by docker-compose / .env). When false, everything stays in
@@ -46,9 +43,10 @@ GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in ("1", "true
 # ---------------------------------------------------------------------------
 # Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-STEPS_PER_REV   = 200      # 200 full steps/rev × 8 (TB6600 DIP set to 1/8
-                            # microstepping). Update if you change the DIPs.
-STEP_PULSE_S    = 0.001     # high/low time of each STEP pulse; raise if it stalls
+MICROSTEP       = 8                 # MUST match the TB6600 DIP switches S4-S6
+STEPS_PER_REV   = 200 * MICROSTEP   # 1.8°/step motor
+STEP_PULSE_S    = 0.0005            # half-period of a STEP pulse (1 kHz rate);
+                                    # raise this if the motor stalls/buzzes
 HOME_ANGLE      = 0
 
 # Predicted-class -> bin angle the stepper rotates to. Symmetric 60° spacing.
@@ -91,10 +89,10 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.55"))
 
 
 # ---------------------------------------------------------------------------
-# Stepper abstraction — real on the Pi, dry-run when the pins aren't set.
+# Stepper abstraction — real on the Pi, dry-run otherwise.
 # ---------------------------------------------------------------------------
 class _DryRunStepper:
-    """Stand-in used when the stepper pins are None — logs moves, no GPIO."""
+    """Stand-in used when GPIO is disabled — logs moves, no GPIO."""
 
     def __init__(self) -> None:
         self.angle = HOME_ANGLE
@@ -108,36 +106,21 @@ class _DryRunStepper:
 
 
 class _RealStepper:
-    """Step/direction stepper driver (TB6600 / A4988 / DRV8825) via gpiozero."""
+    """Thin wrapper around tb6600.TB6600 with the orchestrator's config."""
 
     def __init__(self, step_pin: int, dir_pin: int) -> None:
-        from gpiozero import Device, OutputDevice
-        from gpiozero.pins.lgpio import LGPIOFactory
+        from tb6600 import TB6600
 
-        Device.pin_factory = LGPIOFactory()
-        # active_high=False: TB6600 is wired common-anode (PUL+/DIR+ -> +5V,
-        # PUL-/DIR- -> GPIO), so the opto conducts when the GPIO is driven LOW.
-        # This keeps .on() meaning "assert a step / forward direction".
-        self._step = OutputDevice(step_pin, active_high=False)
-        self._dir = OutputDevice(dir_pin, active_high=False)
-        self._position_steps = 0  # current position in steps, 0 == HOME_ANGLE
+        self._drv = TB6600(step_pin, dir_pin, STEPS_PER_REV,
+                           step_pulse_s=STEP_PULSE_S)
 
     def move_to(self, angle: int) -> None:
         logging.info("stepper -> %d°", angle)
-        target_steps = round(angle / 360 * STEPS_PER_REV)
-        delta = target_steps - self._position_steps
-        self._dir.value = 1 if delta > 0 else 0
-        for _ in range(abs(delta)):
-            self._step.on()
-            time.sleep(STEP_PULSE_S)
-            self._step.off()
-            time.sleep(STEP_PULSE_S)
-        self._position_steps = target_steps
+        self._drv.move_to_angle(angle)
 
     def close(self) -> None:
         self.move_to(HOME_ANGLE)
-        self._step.close()
-        self._dir.close()
+        self._drv.close()
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +179,8 @@ class _RealServo:
 def _make_stepper():
     if not GPIO_ENABLED or STEP_PIN is None or DIR_PIN is None:
         logging.warning(
-            "GPIO disabled or STEP_PIN/DIR_PIN not set — stepper in dry-run mode "
-            "(no GPIO). Set GPIO_ENABLED=true and fill the pins in "
-            "hadrwareCtrl/main.py once wiring is finalised."
+            "GPIO disabled or STEP_PIN/DIR_PIN not set — stepper in dry-run "
+            "mode (no GPIO). Set GPIO_ENABLED=true to drive the real motor."
         )
         return _DryRunStepper()
     return _RealStepper(STEP_PIN, DIR_PIN)
@@ -207,9 +189,8 @@ def _make_stepper():
 def _make_servo():
     if not GPIO_ENABLED or LID_SERVO_PIN is None:
         logging.warning(
-            "GPIO disabled or LID_SERVO_PIN not set — lid servo in dry-run mode "
-            "(no GPIO). Set GPIO_ENABLED=true and fill the pin in "
-            "hadrwareCtrl/main.py once wiring is finalised."
+            "GPIO disabled or LID_SERVO_PIN not set — lid servo in dry-run "
+            "mode (no GPIO). Set GPIO_ENABLED=true to drive the real servo."
         )
         return _DryRunServo()
     return _RealServo(LID_SERVO_PIN)
