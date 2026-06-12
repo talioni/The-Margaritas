@@ -35,9 +35,9 @@ import requests
 # All pin numbers are BCM (the gpiozero default).
 # Leave the stepper pins as None to keep the stepper in dry-run mode, and the
 # servo pin as None to keep the lid servo in dry-run mode.
-STEP_PIN: int | None = None   # STEP input of the stepper driver (A4988/DRV8825-style)
-DIR_PIN: int | None = None    # DIR input of the stepper driver
-LID_SERVO_PIN: int | None = None
+STEP_PIN: int | None = 20   # PUL- of the TB6600 (active-low, common-anode wiring)
+DIR_PIN: int | None = 21    # DIR- of the TB6600
+LID_SERVO_PIN: int | None = 25
 
 # Master switch (set by docker-compose / .env). When false, everything stays in
 # dry-run mode no matter what the pins above are set to.
@@ -46,8 +46,8 @@ GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in ("1", "true
 # ---------------------------------------------------------------------------
 # Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-STEPS_PER_REV   = 200       # full steps per revolution (1.8°/step). Multiply by
-                            # the driver's microstepping if you enable it.
+STEPS_PER_REV   = 1600      # 200 full steps/rev × 8 (TB6600 DIP set to 1/8
+                            # microstepping). Update if you change the DIPs.
 STEP_PULSE_S    = 0.001     # high/low time of each STEP pulse; raise if it stalls
 HOME_ANGLE      = 0
 
@@ -108,15 +108,18 @@ class _DryRunStepper:
 
 
 class _RealStepper:
-    """Step/direction stepper driver (A4988/DRV8825-style) via gpiozero."""
+    """Step/direction stepper driver (TB6600 / A4988 / DRV8825) via gpiozero."""
 
     def __init__(self, step_pin: int, dir_pin: int) -> None:
         from gpiozero import Device, OutputDevice
         from gpiozero.pins.lgpio import LGPIOFactory
 
         Device.pin_factory = LGPIOFactory()
-        self._step = OutputDevice(step_pin)
-        self._dir = OutputDevice(dir_pin)
+        # active_high=False: TB6600 is wired common-anode (PUL+/DIR+ -> +5V,
+        # PUL-/DIR- -> GPIO), so the opto conducts when the GPIO is driven LOW.
+        # This keeps .on() meaning "assert a step / forward direction".
+        self._step = OutputDevice(step_pin, active_high=False)
+        self._dir = OutputDevice(dir_pin, active_high=False)
         self._position_steps = 0  # current position in steps, 0 == HOME_ANGLE
 
     def move_to(self, angle: int) -> None:
@@ -149,6 +152,9 @@ class _DryRunServo:
     def close(self) -> None:
         logging.info("[dry-run servo] lid closed")
 
+    def release(self) -> None:
+        logging.info("[dry-run servo] released")
+
 
 class _RealServo:
     """Lid servo driven by gpiozero. Only imported if LID_SERVO_PIN is set."""
@@ -176,8 +182,14 @@ class _RealServo:
         self._move(LID_OPEN_ANGLE)
 
     def close(self) -> None:
+        # Loop-safe: just drive the lid to the closed position. Does NOT free
+        # the GPIO pin, so the servo can be reopened on the next sort cycle.
         logging.info("servo -> lid closed (%d°)", LID_CLOSED_ANGLE)
         self._move(LID_CLOSED_ANGLE)
+
+    def release(self) -> None:
+        # Shutdown-only: close the lid, then free the GPIO pin.
+        self.close()
         self._servo.close()
 
 
@@ -295,7 +307,7 @@ def main() -> int:
     except KeyboardInterrupt:
         logging.info("interrupted by user")
     finally:
-        servo.close()
+        servo.release()
         stepper.close()
     return 0
 
