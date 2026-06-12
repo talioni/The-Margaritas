@@ -140,24 +140,26 @@ class _DryRunServo:
 
 
 class _RealServo:
-    """Lid servo driven by gpiozero. Only imported if LID_SERVO_PIN is set."""
+    """Lid servo via raw lgpio (same approach as TB6600 — no gpiozero)."""
 
     def __init__(self, pin: int) -> None:
-        from gpiozero import AngularServo, Device
-        from gpiozero.pins.lgpio import LGPIOFactory
+        import lgpio
+        from tb6600 import open_gpiochip
 
-        Device.pin_factory = LGPIOFactory()
-        self._servo = AngularServo(
-            pin,
-            min_angle=SERVO_MIN_ANGLE,
-            max_angle=SERVO_MAX_ANGLE,
-            min_pulse_width=SERVO_MIN_PULSE_S,
-            max_pulse_width=SERVO_MAX_PULSE_S,
-        )
+        self._lgpio = lgpio
+        self._pin = pin
+        self._handle, chip, label = open_gpiochip()
+        logging.info("servo: gpiochip%d (%s) GPIO%d", chip, label, pin)
+        lgpio.gpio_claim_output(self._handle, pin, 0)
         self._move(LID_CLOSED_ANGLE)
 
-    def _move(self, angle: int) -> None:
-        self._servo.angle = angle
+    def _move(self, angle: float) -> None:
+        frac = (angle - SERVO_MIN_ANGLE) / (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE)
+        pulse_us = int(
+            (SERVO_MIN_PULSE_S + frac * (SERVO_MAX_PULSE_S - SERVO_MIN_PULSE_S))
+            * 1_000_000
+        )
+        self._lgpio.tx_servo(self._handle, self._pin, pulse_us)
         time.sleep(SERVO_SETTLE_S)
 
     def open(self) -> None:
@@ -165,15 +167,16 @@ class _RealServo:
         self._move(LID_OPEN_ANGLE)
 
     def close(self) -> None:
-        # Loop-safe: just drive the lid to the closed position. Does NOT free
-        # the GPIO pin, so the servo can be reopened on the next sort cycle.
         logging.info("servo -> lid closed (%d°)", LID_CLOSED_ANGLE)
         self._move(LID_CLOSED_ANGLE)
 
     def release(self) -> None:
-        # Shutdown-only: close the lid, then free the GPIO pin.
         self.close()
-        self._servo.close()
+        self._lgpio.tx_servo(self._handle, self._pin, 0)
+        try:
+            self._lgpio.gpio_free(self._handle, self._pin)
+        finally:
+            self._lgpio.gpiochip_close(self._handle)
 
 
 def _make_stepper():
