@@ -161,6 +161,10 @@ class _RealServo:
         )
         self._lgpio.tx_servo(self._handle, self._pin, pulse_us)
         time.sleep(SERVO_SETTLE_S)
+        # Stop the PWM signal once the servo has reached position.
+        # Continuous software PWM on a non-RT kernel has microsecond-level
+        # jitter that makes cheap servos twitch constantly trying to correct.
+        self._lgpio.tx_servo(self._handle, self._pin, 0)
 
     def open(self) -> None:
         logging.info("servo -> lid open (%d°)", LID_OPEN_ANGLE)
