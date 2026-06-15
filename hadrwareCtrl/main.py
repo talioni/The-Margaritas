@@ -47,7 +47,7 @@ GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in (
 # ---------------------------------------------------------------------------
 # Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-MICROSTEP = 4  # MUST match the TB6600 DIP switches S4-S6
+MICROSTEP = 1  # MUST match the TB6600 DIP switches S4-S6
 STEPS_PER_REV = 200 * MICROSTEP  # 1.8°/step motor
 STEP_PULSE_S = 0.001  # half-period of a STEP pulse (1 kHz rate);
 # raise this if the motor stalls/buzzes
