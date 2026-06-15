@@ -32,44 +32,48 @@ import requests
 # ---------------------------------------------------------------------------
 # PIN LAYOUT (BCM numbering)
 # ---------------------------------------------------------------------------
-STEP_PIN: int | None = 20   # TB6600 PUL-  (PUL+ -> 3.3 V, physical pin 1)
-DIR_PIN: int | None = 21    # TB6600 DIR-  (DIR+ -> 3.3 V)
+STEP_PIN: int | None = 20  # TB6600 PUL-  (PUL+ -> 3.3 V, physical pin 1)
+DIR_PIN: int | None = 21  # TB6600 DIR-  (DIR+ -> 3.3 V)
 LID_SERVO_PIN: int | None = 25
 
 # Master switch (set by docker-compose / .env). When false, everything stays in
 # dry-run mode no matter what the pins above are set to.
-GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+GPIO_ENABLED = os.getenv("GPIO_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # ---------------------------------------------------------------------------
 # Stepper behaviour (bin positioning)
 # ---------------------------------------------------------------------------
-MICROSTEP       = 8                 # MUST match the TB6600 DIP switches S4-S6
-STEPS_PER_REV   = 200 * MICROSTEP   # 1.8°/step motor
-STEP_PULSE_S    = 0.0005            # half-period of a STEP pulse (1 kHz rate);
-                                    # raise this if the motor stalls/buzzes
-HOME_ANGLE      = 0
+MICROSTEP = 1  # MUST match the TB6600 DIP switches S4-S6
+STEPS_PER_REV = 200 * MICROSTEP  # 1.8°/step motor
+STEP_PULSE_S = 0.001  # half-period of a STEP pulse (1 kHz rate);
+# raise this if the motor stalls/buzzes
+HOME_ANGLE = 0
 
 # Predicted-class -> bin angle the stepper rotates to. Symmetric 60° spacing.
 CLASS_TO_ANGLE: dict[str, int] = {
-    "organic":    -60,
-    "pmd":          0,
-    "restafval":   60,
+    "organic": -60,
+    "pmd": 0,
+    "restafval": 60,
 }
 
 # ---------------------------------------------------------------------------
 # Lid servo behaviour
 # ---------------------------------------------------------------------------
-SERVO_MIN_ANGLE   = -90
-SERVO_MAX_ANGLE   =  90
+SERVO_MIN_ANGLE = -90
+SERVO_MAX_ANGLE = 90
 SERVO_MIN_PULSE_S = 0.0005  # tune for the specific servo if it jitters
 SERVO_MAX_PULSE_S = 0.0025
-SERVO_SETTLE_S    = 0.4     # wait after each move before considering it done
+SERVO_SETTLE_S = 0.4  # wait after each move before considering it done
 
-LID_OPEN_ANGLE    = 90
-LID_CLOSED_ANGLE  = 0
+LID_OPEN_ANGLE = 90
+LID_CLOSED_ANGLE = 0
 
-HOLD_LID_OPEN_S      = 3.0  # how long the lid stays open to let the item drop
-COOLDOWN_AFTER_SORT_S = 1.5 # short pause before asking imageRec for the next item
+HOLD_LID_OPEN_S = 3.0  # how long the lid stays open to let the item drop
+COOLDOWN_AFTER_SORT_S = 1.5  # short pause before asking imageRec for the next item
 
 # ---------------------------------------------------------------------------
 # imageRec endpoint
@@ -111,8 +115,7 @@ class _RealStepper:
     def __init__(self, step_pin: int, dir_pin: int) -> None:
         from tb6600 import TB6600
 
-        self._drv = TB6600(step_pin, dir_pin, STEPS_PER_REV,
-                           step_pulse_s=STEP_PULSE_S)
+        self._drv = TB6600(step_pin, dir_pin, STEPS_PER_REV, step_pulse_s=STEP_PULSE_S)
 
     def move_to(self, angle: int) -> None:
         logging.info("stepper -> %d°", angle)
@@ -213,20 +216,28 @@ def _wait_for_prediction() -> dict | None:
         try:
             resp = requests.get(url, timeout=WAIT_PREDICT_TIMEOUT_S)
         except requests.exceptions.RequestException as e:
-            logging.warning("imageRec not reachable (%s) — retrying in %.1fs",
-                            e, API_RETRY_BACKOFF_S)
+            logging.warning(
+                "imageRec not reachable (%s) — retrying in %.1fs",
+                e,
+                API_RETRY_BACKOFF_S,
+            )
             time.sleep(API_RETRY_BACKOFF_S)
             continue
 
         # 503 = camera not available / not initialised yet
         if resp.status_code == 503:
-            logging.warning("imageRec reports camera unavailable — retrying in %.1fs",
-                            API_RETRY_BACKOFF_S)
+            logging.warning(
+                "imageRec reports camera unavailable — retrying in %.1fs",
+                API_RETRY_BACKOFF_S,
+            )
             time.sleep(API_RETRY_BACKOFF_S)
             continue
         if resp.status_code != 200:
-            logging.warning("imageRec returned HTTP %d: %s — retrying",
-                            resp.status_code, resp.text[:200])
+            logging.warning(
+                "imageRec returned HTTP %d: %s — retrying",
+                resp.status_code,
+                resp.text[:200],
+            )
             time.sleep(API_RETRY_BACKOFF_S)
             continue
 
@@ -276,12 +287,17 @@ def main() -> int:
             if result is None:
                 continue
 
-            cls    = result.get("top")
-            conf   = float(result.get("confidence", 0.0))
+            cls = result.get("top")
+            conf = float(result.get("confidence", 0.0))
             unsure = bool(result.get("unsure", False))
             waited = result.get("waited_seconds", "?")
-            logging.info("prediction: %s (%.1f%%) unsure=%s after %ss",
-                         cls, conf * 100, unsure, waited)
+            logging.info(
+                "prediction: %s (%.1f%%) unsure=%s after %ss",
+                cls,
+                conf * 100,
+                unsure,
+                waited,
+            )
 
             # "unsure" covers /wait_and_predict timing out: the API then returns
             # its LAST frame's result, whose confidence can still read high even
