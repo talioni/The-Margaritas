@@ -1,6 +1,6 @@
 services:
   trash-api:
-    build: .
+    build: ./imageRec
     image: trash-api
     container_name: trash-api
     restart: unless-stopped
@@ -16,9 +16,11 @@ services:
     environment:
       MODEL_PATH: /app/model/best.pt
       CAMERA_INDEX: "0"
+      # Stream stdout live instead of buffering it (so /wait_and_predict's
+      # per-frame logs show up in `docker logs` in real time, not in chunks).
+      PYTHONUNBUFFERED: "1"
     # Local only: reachable from the Pi host (127.0.0.1), never the LAN.
-    # When the main program is containerized, drop this and have it join
-    # trashnet and call http://trash-api:8000 directly.
+    # hadrware-ctrl reaches it over the docker network as http://trash-api:8000
     ports:
       - "127.0.0.1:8000:8000"
     networks:
@@ -29,6 +31,25 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+
+  hadrware-ctrl:
+    build: ./hadrwareCtrl
+    image: hadrware-ctrl
+    container_name: hadrware-ctrl
+    restart: unless-stopped
+    depends_on:
+      trash-api:
+        condition: service_healthy
+    # GPIO access on the Pi. Off by default so the container starts on any host
+    # (dry-run). Enable real GPIO with GPIO_ENABLED=true (e.g. in a .env file):
+    # privileged grants device access without naming specific nodes, so the
+    # container also starts on machines that have no gpiochips.
+    privileged: ${GPIO_ENABLED:-false}
+    environment:
+      IMAGE_REC_URL: "http://trash-api:8000"
+      GPIO_ENABLED: "${GPIO_ENABLED:-false}"
+    networks:
+      - trashnet
 
 networks:
   trashnet:

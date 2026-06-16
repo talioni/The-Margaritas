@@ -1,0 +1,2 @@
+requests>=2.31
+lgpio>=0.2.2.0
