@@ -14,9 +14,16 @@ LID_CLOSED_ANGLE in main.py. If it JITTERS or buzzes at rest: tune
 SERVO_MIN_PULSE_S / SERVO_MAX_PULSE_S for your specific servo.
 """
 
-import logging
-import time
+# ---- What this file is for ----
+# A tiny test program just for the lid servo. It opens and closes the lid a few
+# times so you can check the lid moves correctly, WITHOUT needing the camera or
+# the rest of the system running.
 
+import logging  # tidy messages
+import time     # pauses
+
+# Borrow the real settings and the real servo code from main.py so we test the
+# exact same setup the finished product uses.
 from main import HOLD_LID_OPEN_S, LID_SERVO_PIN, _RealServo
 
 
@@ -24,28 +31,29 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    if LID_SERVO_PIN is None:
+    if LID_SERVO_PIN is None:                 # no pin set = nothing to test
         logging.error("LID_SERVO_PIN is None in main.py — nothing to test.")
         return 1
 
     logging.info("Testing lid servo on GPIO%d", LID_SERVO_PIN)
-    servo = _RealServo(LID_SERVO_PIN)  # constructs at the closed position
+    servo = _RealServo(LID_SERVO_PIN)         # build the real servo (starts closed)
 
     try:
-        for i in range(3):
+        for i in range(3):                    # do three open/close cycles
             logging.info("cycle %d: opening lid", i + 1)
-            servo.open()
-            time.sleep(HOLD_LID_OPEN_S)
+            servo.open()                      # open the lid
+            time.sleep(HOLD_LID_OPEN_S)       # hold it open like a real sort does
             logging.info("cycle %d: closing lid", i + 1)
-            servo.close()
-            time.sleep(1.0)
+            servo.close()                     # close the lid
+            time.sleep(1.0)                   # short rest before the next cycle
         logging.info("Done. Lid left closed.")
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:                 # Ctrl-C
         logging.info("interrupted")
     finally:
-        servo.release()
+        servo.release()                       # always release the pin at the end
     return 0
 
 
+# Run main() only when launched directly.
 if __name__ == "__main__":
     raise SystemExit(main())
