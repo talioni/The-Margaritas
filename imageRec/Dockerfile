@@ -1,6 +1,11 @@
+# ---- What a Dockerfile is ----
+# A recipe that builds a "container image": a mini computer with Python, our
+# code, and the AI model all installed, so it runs the same on any machine.
+# This one packages the camera/AI program (imageRec).
+#
 # Builds natively on the Raspberry Pi 5 (arm64). On the Pi:
 #   docker compose build && docker compose up
-FROM python:3.11-slim
+FROM python:3.11-slim          # start from a small image that has Python 3.11
 
 # Runtime libs ultralytics/opencv-headless need. No libgl1 thanks to the
 # headless OpenCV wheel; libglib2.0-0 + libgomp1 are still required.
@@ -29,5 +34,6 @@ ENV MODEL_PATH=/app/model/best.pt \
     YOLO_AUTOINSTALL=false \
     YOLO_OFFLINE=true
 
-EXPOSE 8000
+EXPOSE 8000     # tell Docker the API listens on port 8000
+# The command that runs when the container starts: launch the web server.
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

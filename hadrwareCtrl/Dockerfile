@@ -1,6 +1,11 @@
+# ---- What a Dockerfile is ----
+# A recipe that builds a "container image" (a mini computer with everything
+# installed). This one packages the hardware controller (hadrwareCtrl) that
+# drives the stepper motor and lid servo.
+#
 # Builds natively on the Raspberry Pi 5 (arm64). On the Pi:
 #   docker compose build && docker compose up
-FROM python:3.11-slim
+FROM python:3.11-slim          # start from a small Python 3.11 image
 
 # lgpio is needed by gpiozero to actually talk to the Pi 5 GPIO chip.
 # It binds against /usr/include/lgpio.h at build time.
@@ -24,4 +29,6 @@ COPY tb6600.py /app/tb6600.py
 # `docker compose up` time if you rename the service.
 ENV IMAGE_REC_URL=http://trash-api:8000
 
+# The command that runs when the container starts. -u = unbuffered output so
+# log messages appear straight away in `docker logs`.
 CMD ["python", "-u", "main.py"]
