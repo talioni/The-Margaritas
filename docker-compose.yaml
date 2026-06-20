@@ -1,0 +1,66 @@
+# ---- What this file is ----
+# docker-compose describes how to run the whole app as a set of "containers"
+# (mini self-contained computers) with one command: `docker compose up`.
+# We define TWO containers here:
+#   trash-api      -> the camera/AI program (imageRec)
+#   hadrware-ctrl  -> the motor/lid program (hadrwareCtrl)
+# They talk to each other over a private network defined at the bottom.
+
+services:                       # the list of containers to run
+  trash-api:                    # container #1: the camera + AI brain
+    build: ./imageRec           # build it using the Dockerfile in ./imageRec
+    image: trash-api            # name the built image "trash-api"
+    container_name: trash-api   # the running container's name
+    restart: unless-stopped     # auto-restart it if it crashes
+    # Pass the USB webcam into the container. If your camera is not video0,
+    # change both sides and set CAMERA_INDEX accordingly.
+    devices:
+      - "/dev/video0:/dev/video0"
+    # Let the container user open the video device without running privileged.
+    # If this still fails, replace "video" with the host GID from
+    #   getent group video
+    group_add:
+      - "video"
+    environment:
+      MODEL_PATH: /app/model/best.pt
+      CAMERA_INDEX: "0"
+      # Stream stdout live instead of buffering it (so /wait_and_predict's
+      # per-frame logs show up in `docker logs` in real time, not in chunks).
+      PYTHONUNBUFFERED: "1"
+    # Local only: reachable from the Pi host (127.0.0.1), never the LAN.
+    # hadrware-ctrl reaches it over the docker network as http://trash-api:8000
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - trashnet
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  hadrware-ctrl:                # container #2: the hardware controller
+    build: ./hadrwareCtrl       # build it from the Dockerfile in ./hadrwareCtrl
+    image: hadrware-ctrl
+    container_name: hadrware-ctrl
+    restart: unless-stopped
+    depends_on:                 # don't start this until...
+      trash-api:                # ...the camera container...
+        condition: service_healthy   # ...passes its health check (is ready)
+    # GPIO access on the Pi. Off by default so the container starts on any host
+    # (dry-run). Enable real GPIO with GPIO_ENABLED=true (e.g. in a .env file):
+    # privileged grants device access without naming specific nodes, so the
+    # container also starts on machines that have no gpiochips.
+    privileged: ${GPIO_ENABLED:-false}
+    environment:
+      IMAGE_REC_URL: "http://trash-api:8000"
+      GPIO_ENABLED: "${GPIO_ENABLED:-false}"
+    networks:
+      - trashnet
+
+# The private network both containers join so they can find each other by
+# name (the controller reaches the camera at http://trash-api:8000).
+networks:
+  trashnet:
+    driver: bridge              # a standard local Docker network

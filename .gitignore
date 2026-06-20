@@ -22,3 +22,6 @@ runs/classify/train/train_batch*.jpg
 runs/classify/train/val_batch*.jpg
 runs/classify/train/confusion_matrix*.png
 runs/classify/train/weights/last.pt
+
+# Docker
+.env
